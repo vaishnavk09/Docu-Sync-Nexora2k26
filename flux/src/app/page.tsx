@@ -1,21 +1,558 @@
 "use client";
-import { useEffect, useState } from "react";
-import { db } from "@/lib/firebase";
-import { collection, getDocs } from "firebase/firestore";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { JSONContent } from "@tiptap/core";
+
+import Editor from "@/components/Editor";
+import { useDocumentSync } from "@/hooks/useDocumentSync";
+import { usePresence } from "@/hooks/usePresence";
+import { useAuth } from "@/hooks/useAuth";
+import { signInWithGoogle, signOutUser } from "@/lib/auth";
+import { getUserColor } from "@/lib/color";
+
+const initialDoc: JSONContent = {
+  type: "doc",
+  content: [{ type: "paragraph" }],
+};
+
+const DOC_ID = "main";
+
+type Snapshot = {
+  _id: string;
+  docId: string;
+  content: JSONContent;
+  timestamp: number;
+  authorId: string;
+};
+
+function getAuthErrorMessage(error: unknown) {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: string }).code;
+
+    switch (code) {
+      case "auth/popup-blocked":
+        return "Popup blocked. Allow popups and try again.";
+      case "auth/cancelled-popup-request":
+        return "Sign-in cancelled.";
+      default:
+        return "Authentication failed.";
+    }
+  }
+
+  return "Authentication error.";
+}
+
+function getUserLabelFromId(userId: string | undefined, users: { userId: string; email: string }[]) {
+  if (!userId) return "unknown";
+
+  const user = users.find((entry) => entry.userId === userId);
+  return user?.email ?? userId.slice(0, 6);
+}
+
+function formatTimeAgo(timestamp: number) {
+  const diff = Date.now() - timestamp;
+
+  if (diff < 1000) return "just now";
+  if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+
+  return new Date(timestamp).toLocaleTimeString();
+}
 
 export default function Home() {
-  const [status, setStatus] = useState("Connecting to Firebase...");
+  const { user, loading } = useAuth();
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [doc, setDoc] = useState<JSONContent>(initialDoc);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+  const [deletingSnapshotId, setDeletingSnapshotId] = useState<string | null>(null);
+  const [showClearSnapshotsModal, setShowClearSnapshotsModal] = useState(false);
+  const lastSnapshotRef = useRef<JSONContent | null>(null);
+  const lastEditRef = useRef<number>(0);
+  const isRestoringRef = useRef(false);
+
+  const userId = user?.uid ?? "anonymous";
+  const userLabel = user?.email ?? "anonymous";
+
+  const { meta } = useDocumentSync(userId, doc, setDoc);
+
+  const userColor = useMemo(() => getUserColor(userId), [userId]);
+  const { activeUsers } = usePresence(userId, userLabel, userColor);
+
+  const loadSnapshots = async () => {
+    try {
+      const response = await fetch(`/api/snapshot?docId=${DOC_ID}`, {
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to load snapshots.");
+      }
+
+      const data = (await response.json()) as Snapshot[];
+      setSnapshots(data);
+      setSnapshotError(null);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to load snapshots.";
+      setSnapshotError(message);
+    }
+  };
+
+  const saveSnapshot = async () => {
+    if (!user || savingSnapshot || !doc.content?.length) return;
+
+    try {
+      setSavingSnapshot(true);
+      setSnapshotError(null);
+
+      const response = await fetch("/api/snapshot", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          docId: DOC_ID,
+          content: doc,
+          authorId: userId,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to save snapshot.");
+      }
+
+      const newSnapshot = (await response.json()) as Snapshot;
+      setSnapshots((prev) => [newSnapshot, ...prev]);
+      lastSnapshotRef.current = doc;
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to save snapshot.";
+      setSnapshotError(message);
+    } finally {
+      setSavingSnapshot(false);
+    }
+  };
+
+  const deleteSnapshot = async (snapshotId: string) => {
+    try {
+      setDeletingSnapshotId(snapshotId);
+      setSnapshotError(null);
+
+      const response = await fetch(`/api/snapshot?snapshotId=${snapshotId}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to delete snapshot.");
+      }
+
+      setSnapshots((prev) => prev.filter((snapshot) => snapshot._id !== snapshotId));
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to delete snapshot.";
+      setSnapshotError(message);
+    } finally {
+      setDeletingSnapshotId(null);
+    }
+  };
+
+  const clearAllSnapshots = async () => {
+    try {
+      setSnapshotError(null);
+
+      const response = await fetch(`/api/snapshot?docId=${DOC_ID}&clearAll=true`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to clear snapshots.");
+      }
+
+      setSnapshots([]);
+      setShowClearSnapshotsModal(false);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to clear snapshots.";
+      setSnapshotError(message);
+    }
+  };
 
   useEffect(() => {
-    getDocs(collection(db, "test"))
-      .then(() => setStatus("Firebase connected successfully!"))
-      .catch((e) => setStatus("Error: " + e.message));
-  }, []);
+    if (!user) {
+      setSnapshots([]);
+      return;
+    }
+
+    void loadSnapshots();
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+
+    if (isRestoringRef.current) {
+      isRestoringRef.current = false;
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      const now = Date.now();
+
+      if (now - lastEditRef.current < 5000) {
+        if (
+          lastSnapshotRef.current &&
+          JSON.stringify(lastSnapshotRef.current) === JSON.stringify(doc)
+        ) {
+          return;
+        }
+
+        if (document.visibilityState !== "visible") return;
+
+        void saveSnapshot();
+      }
+    }, 5000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [doc, user]);
+
+  const handleSignIn = async () => {
+    if (submitting) return;
+
+    try {
+      setSubmitting(true);
+      setAuthError(null);
+      await signInWithGoogle();
+    } catch (error) {
+      setAuthError(getAuthErrorMessage(error));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    if (submitting) return;
+
+    try {
+      setSubmitting(true);
+      setAuthError(null);
+      await signOutUser();
+    } catch (error) {
+      setAuthError(getAuthErrorMessage(error));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <main style={{ padding: 40, fontFamily: "monospace", fontSize: 18 }}>
+        <h1>Flux</h1>
+        <p>Loading...</p>
+      </main>
+    );
+  }
 
   return (
-    <main style={{ padding: 40, fontFamily: "monospace", fontSize: 18 }}>
-      <h1>Flux</h1>
-      <p>{status}</p>
+    <main
+      style={{
+        minHeight: "100vh",
+        padding: 24,
+        fontFamily: "Arial, sans-serif",
+        backgroundColor: "#f7f7fb",
+        color: "#111827",
+      }}
+    >
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 16,
+          padding: 16,
+          marginBottom: 20,
+          border: "1px solid #e5e7eb",
+          borderRadius: 12,
+          backgroundColor: "#ffffff",
+        }}
+      >
+        <div>
+          <h1 style={{ margin: 0, fontSize: 28 }}>Flux</h1>
+          <p style={{ margin: "6px 0 0", color: "#6b7280" }}>
+            Real-time collaborative editor
+          </p>
+        </div>
+
+        {user ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+              justifyContent: "flex-end",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "8px 12px",
+                borderRadius: 999,
+                backgroundColor: "#f3f4f6",
+              }}
+            >
+              <span
+                style={{
+                  width: 12,
+                  height: 12,
+                  borderRadius: "50%",
+                  backgroundColor: userColor,
+                  display: "inline-block",
+                }}
+              />
+              <span>{userLabel}</span>
+            </div>
+            <button type="button" onClick={() => void saveSnapshot()} disabled={savingSnapshot}>
+              {savingSnapshot ? "Saving Snapshot..." : "Save Snapshot"}
+            </button>
+            <button type="button" onClick={handleSignOut} disabled={submitting}>
+              {submitting ? "Signing out..." : "Sign Out"}
+            </button>
+          </div>
+        ) : null}
+      </header>
+
+      {!user ? (
+        <div
+          style={{
+            padding: 24,
+            border: "1px solid #e5e7eb",
+            borderRadius: 12,
+            backgroundColor: "#ffffff",
+          }}
+        >
+          <button type="button" onClick={handleSignIn} disabled={submitting}>
+            {submitting ? "Signing in..." : "Sign in with Google"}
+          </button>
+        </div>
+      ) : (
+        <section
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(0, 7fr) minmax(280px, 3fr)",
+            gap: 20,
+            alignItems: "start",
+          }}
+        >
+          <div
+            style={{
+              padding: 20,
+              border: "1px solid #e5e7eb",
+              borderRadius: 12,
+              backgroundColor: "#ffffff",
+              minHeight: 500,
+            }}
+          >
+            <div style={{ marginBottom: 16 }}>
+              <p style={{ margin: 0, fontWeight: 600 }}>
+                {user.displayName ?? "Anonymous User"}
+              </p>
+              <p style={{ margin: "6px 0 0", color: "#6b7280" }}>{userLabel}</p>
+            </div>
+            <div style={{ marginBottom: 12, fontSize: 13, color: "#6b7280" }}>
+              {meta.updatedBy ? (
+                <>
+                  Last edited by{" "}
+                  <strong>
+                    {meta.updatedBy === userId
+                      ? "you"
+                      : getUserLabelFromId(meta.updatedBy, activeUsers)}
+                  </strong>{" "}
+                  {meta.updatedAt ? <>• {formatTimeAgo(meta.updatedAt)}</> : null}
+                </>
+              ) : (
+                "No edits yet"
+              )}
+            </div>
+            <Editor
+              value={doc}
+              onChange={(newDoc) => {
+                lastEditRef.current = Date.now();
+                setDoc(newDoc);
+              }}
+            />
+          </div>
+
+          <aside
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 16,
+            }}
+          >
+            <section
+              style={{
+                padding: 16,
+                border: "1px solid #e5e7eb",
+                borderRadius: 12,
+                backgroundColor: "#ffffff",
+              }}
+            >
+              <h2 style={{ marginTop: 0, marginBottom: 12, fontSize: 18 }}>Active Users</h2>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {activeUsers.map((activeUser) => {
+                  const isCurrentUser = activeUser.userId === userId;
+
+                  return (
+                    <div
+                      key={activeUser.userId}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        padding: "8px 10px",
+                        borderRadius: 10,
+                        backgroundColor: isCurrentUser ? "#eef2ff" : "#f9fafb",
+                        border: isCurrentUser ? "1px solid #c7d2fe" : "1px solid #f3f4f6",
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 12,
+                          height: 12,
+                          borderRadius: "50%",
+                          backgroundColor: activeUser.color,
+                          display: "inline-block",
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {activeUser.email}
+                        {isCurrentUser ? " (you)" : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section
+              style={{
+                padding: 16,
+                border: "1px solid #e5e7eb",
+                borderRadius: 12,
+                backgroundColor: "#ffffff",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  marginBottom: 12,
+                }}
+              >
+                <h2 style={{ margin: 0, fontSize: 18 }}>Snapshots</h2>
+                <button type="button" onClick={() => setShowClearSnapshotsModal(true)}>
+                  Clear All
+                </button>
+              </div>
+              <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
+                {snapshots.map((snapshot) => (
+                  <div
+                    key={snapshot._id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 8,
+                      padding: 12,
+                      borderRadius: 10,
+                      border: "1px solid #e5e7eb",
+                      backgroundColor: "#f9fafb",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        isRestoringRef.current = true;
+                        setDoc(snapshot.content);
+                      }}
+                      style={{
+                        border: "none",
+                        background: "transparent",
+                        textAlign: "left",
+                        padding: 0,
+                        flex: 1,
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div>{new Date(snapshot.timestamp).toLocaleString()}</div>
+                      <div style={{ color: "#6b7280", fontSize: 12 }}>
+                        {snapshot.authorId.slice(0, 8)}
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteSnapshot(snapshot._id)}
+                      disabled={deletingSnapshotId === snapshot._id}
+                    >
+                      {deletingSnapshotId === snapshot._id ? "Deleting..." : "Delete"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </aside>
+        </section>
+      )}
+
+      {showClearSnapshotsModal ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            backgroundColor: "rgba(17, 24, 39, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+          }}
+        >
+          <div
+            style={{
+              width: "100%",
+              maxWidth: 420,
+              backgroundColor: "#ffffff",
+              borderRadius: 12,
+              padding: 20,
+              border: "1px solid #e5e7eb",
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>Clear all snapshots?</h3>
+            <p style={{ color: "#6b7280" }}>
+              This will permanently remove all saved snapshots for this document.
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12 }}>
+              <button type="button" onClick={() => setShowClearSnapshotsModal(false)}>
+                Cancel
+              </button>
+              <button type="button" onClick={() => void clearAllSnapshots()}>
+                Delete All
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {authError ? <p>Error: {authError}</p> : null}
+      {snapshotError ? <p>Snapshot Error: {snapshotError}</p> : null}
     </main>
   );
 }

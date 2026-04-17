@@ -5,18 +5,35 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import Placeholder from "@tiptap/extension-placeholder";
 import StarterKit from "@tiptap/starter-kit";
 import type { JSONContent } from "@tiptap/core";
-import { Paragraph } from "@tiptap/extension-paragraph";
+import { Extension } from "@tiptap/core";
 
-const CustomParagraph = Paragraph.extend({
-  addAttributes() {
-    return {
-      authorId: {
-        default: null,
+const GlobalAttributes = Extension.create({
+  name: 'globalAttributes',
+  addGlobalAttributes() {
+    return [
+      {
+        types: ['paragraph', 'heading', 'bulletList', 'orderedList', 'listItem'],
+        attributes: {
+          authorId: {
+            default: null,
+            parseHTML: (element) => element.getAttribute('data-author-id'),
+            renderHTML: (attributes) => {
+              if (!attributes.authorId) return {};
+              return { 'data-author-id': attributes.authorId };
+            },
+          },
+          nodeId: {
+            // Use null default — factory functions are NOT serializable to Firestore
+            default: null,
+            parseHTML: (element) => element.getAttribute('data-node-id'),
+            renderHTML: (attributes) => {
+              if (!attributes.nodeId) return {};
+              return { 'data-node-id': attributes.nodeId };
+            },
+          },
+        },
       },
-      nodeId: {
-        default: () => crypto.randomUUID(),
-      },
-    };
+    ];
   },
 });
 
@@ -38,10 +55,8 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
   const editor = useEditor({
     immediatelyRender: false,
     extensions: [
-      StarterKit.configure({
-        paragraph: false,
-      }),
-      CustomParagraph,
+      StarterKit,
+      GlobalAttributes,
       Placeholder.configure({
         placeholder: "Start typing collaboratively...",
       }),
@@ -50,7 +65,7 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
     onSelectionUpdate: ({ editor: currentEditor }) => {
       function getCurrentAuthor() {
         const { $head } = currentEditor.state.selection;
-        if ($head && $head.parent && $head.parent.type.name === "paragraph") {
+        if ($head && $head.parent && ["paragraph", "heading", "bulletList", "orderedList", "listItem"].includes($head.parent.type.name)) {
           return $head.parent.attrs.authorId || null;
         }
         return null;
@@ -65,7 +80,7 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
 
       function getCurrentAuthor() {
         const { $head } = currentEditor.state.selection;
-        if ($head && $head.parent && $head.parent.type.name === "paragraph") {
+        if ($head && $head.parent && ["paragraph", "heading", "bulletList", "orderedList", "listItem"].includes($head.parent.type.name)) {
           return $head.parent.attrs.authorId || null;
         }
         return null;
@@ -75,7 +90,7 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
       const { $head } = state.selection;
       const node = $head.parent;
 
-      if (node && node.type.name === "paragraph" && node.attrs.authorId !== userId) {
+      if (node && ["paragraph", "heading", "bulletList", "orderedList", "listItem"].includes(node.type.name) && node.attrs.authorId !== userId) {
         const pos = $head.before();
         view.dispatch(
           state.tr.setNodeMarkup(pos, undefined, {
@@ -110,38 +125,52 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
   }
 
   const toolbarBtnStyle = (isActive: boolean) => ({
-    padding: "4px 10px",
-    fontSize: 13,
-    fontWeight: isActive ? 700 : 500,
-    border: isActive ? "1px solid #6366f1" : "1px solid #d1d5db",
-    borderRadius: 6,
-    backgroundColor: isActive ? "#eef2ff" : "#ffffff",
-    color: isActive ? "#4338ca" : "#374151",
+    padding: "6px 12px",
+    fontSize: "0.875rem",
+    fontWeight: isActive ? 600 : 500,
+    border: "none",
+    borderRadius: "8px",
+    backgroundColor: isActive ? "var(--surface-hover)" : "transparent",
+    color: isActive ? "var(--accent)" : "var(--foreground-muted)",
     cursor: "pointer" as const,
+    transition: "all 0.2s ease",
   });
 
   return (
     <>
       <div
+        className="animate-slide-up"
         style={{
-          border: "1px solid #d1d5db",
-          borderRadius: 12,
-          padding: 14,
-          minHeight: 280,
+          padding: "24px 0",
+          minHeight: "calc(100vh - 200px)",
           cursor: "text",
-          backgroundColor: "#ffffff",
-          boxShadow: "0 1px 2px rgba(0, 0, 0, 0.04)",
+          backgroundColor: "var(--surface)",
+        }}
+        onClick={() => {
+          if (editor && !editor.isFocused) {
+            editor.chain().focus().run();
+          }
         }}
       >
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 4,
-            padding: "6px 0 10px",
-            borderBottom: "1px solid #e5e7eb",
-            marginBottom: 12,
+            justifyContent: "center",
+            gap: 6,
+            padding: "8px 16px",
+            marginBottom: 32,
             flexWrap: "wrap",
+            position: "sticky",
+            top: 16,
+            zIndex: 10,
+            background: "rgba(255, 255, 255, 0.8)",
+            backdropFilter: "blur(8px)",
+            borderRadius: "16px",
+            border: "1px solid var(--border-subtle)",
+            boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.05)",
+            maxWidth: "max-content",
+            margin: "0 auto 32px",
           }}
         >
           <button
@@ -163,6 +192,8 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
             type="button"
             onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleHeading({ level: 1 }).run(); }}
             style={toolbarBtnStyle(editor.isActive("heading", { level: 1 }))}
+            onMouseEnter={(e) => { if (!editor.isActive("heading", { level: 1 })) (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--surface-hover)'; }}
+            onMouseLeave={(e) => { if (!editor.isActive("heading", { level: 1 })) (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
           >
             H1
           </button>
@@ -199,46 +230,7 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
         <EditorContent editor={editor} className="flux-editor-content" />
       </div>
 
-      <style jsx global>{`
-        .flux-editor-content .ProseMirror {
-          min-height: 220px;
-          outline: none;
-          color: #111827;
-          font-size: 16px;
-          line-height: 1.7;
-          white-space: pre-wrap;
-          word-break: break-word;
-        }
 
-        .flux-editor-content .ProseMirror p {
-          margin: 0 0 0.9em;
-        }
-
-        .flux-editor-content .ProseMirror p.is-editor-empty:first-child::before {
-          content: attr(data-placeholder);
-          color: #9ca3af;
-          float: left;
-          height: 0;
-          pointer-events: none;
-        }
-
-        .flux-editor-content .ProseMirror-focused {
-          outline: none;
-        }
-
-        .flux-editor-content .ProseMirror h1,
-        .flux-editor-content .ProseMirror h2,
-        .flux-editor-content .ProseMirror h3 {
-          margin: 1em 0 0.5em;
-          line-height: 1.25;
-        }
-
-        .flux-editor-content .ProseMirror ul,
-        .flux-editor-content .ProseMirror ol {
-          padding-left: 1.4rem;
-          margin: 0.75em 0;
-        }
-      `}</style>
     </>
   );
 }

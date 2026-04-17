@@ -10,26 +10,25 @@ function extractText(node: any): string {
 
 // Stub function to call generic AI model via HTTP fetch avoiding extra dependencies
 async function generateSummary(text: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
 
   if (!apiKey) {
-    return "Please set GEMINI_API_KEY in your .env file to enable summarization.";
+    return "Please set GROQ_API_KEY in your .env file to enable summarization.";
   }
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+    const response = await fetch(`https://api.groq.com/openai/v1/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        contents: [
+        model: "llama-3.1-8b-instant",
+        messages: [
           {
-            parts: [
-              {
-                text: `Summarize the following text in 3-5 concise bullet points:\n\n${text}`,
-              },
-            ],
+            role: "user",
+            content: `Summarize the following text in 3-5 concise bullet points:\n\n${text}`,
           },
         ],
       }),
@@ -37,12 +36,12 @@ async function generateSummary(text: string): Promise<string> {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("Gemini API Error:", response.status, response.statusText, errorText);
+      console.error("Groq API Error:", response.status, response.statusText, errorText);
       return "Unable to generate summary at this time (API Error).";
     }
 
     const data = await response.json();
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text || "Empty response from AI.";
+    return data?.choices?.[0]?.message?.content || "Empty response from AI.";
   } catch (error) {
     return "Failed to connect to AI service.";
   }

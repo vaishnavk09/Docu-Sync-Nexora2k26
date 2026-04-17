@@ -55,6 +55,26 @@ function intelligentlyMerge(local: JSONContent, incoming: JSONContent, base: JSO
   return { ...incoming, content: merged };
 }
 
+/**
+ * Recursively strips any non-Firestore-serializable values (functions, undefined)
+ * from a JSON document tree before writing to Firestore.
+ */
+function sanitizeForFirestore(obj: unknown): unknown {
+  if (typeof obj === 'function') return null;
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) {
+    return (obj as unknown[]).map(sanitizeForFirestore);
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const sanitized = sanitizeForFirestore(value);
+    if (sanitized !== undefined) {
+      result[key] = sanitized;
+    }
+  }
+  return result;
+}
+
 export function useDocumentSync(
   userId: string,
   localDoc: JSONContent,
@@ -87,7 +107,7 @@ export function useDocumentSync(
           lastSentRef.current = localDocRef.current;
 
           await setDoc(docRef, {
-            content: localDocRef.current,
+            content: sanitizeForFirestore(localDocRef.current),
             updatedAt: Date.now(),
             updatedBy: userId,
           }, { merge: true });
@@ -164,7 +184,7 @@ export function useDocumentSync(
       lastSentRef.current = localDoc;
 
       void setDoc(docRef, {
-        content: localDoc,
+        content: sanitizeForFirestore(localDoc),
         updatedAt: nextUpdatedAt,
         updatedBy: userId,
       }, { merge: true });

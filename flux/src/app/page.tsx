@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import type { JSONContent } from "@tiptap/core";
 import { doc as firestoreDoc, setDoc as firestoreSetDoc, deleteDoc as firestoreDeleteDoc } from "firebase/firestore";
 
@@ -13,6 +13,7 @@ import { useCursorPresence } from "@/hooks/useCursorPresence";
 import { db } from "@/lib/firebase";
 import { signInWithGoogle, signOutUser } from "@/lib/auth";
 import { getUserColor } from "@/lib/color";
+import TeamManager from "@/components/TeamManager";
 
 function throttle<T extends (...args: any[]) => void>(fn: T, delay: number) {
   let last = 0;
@@ -30,14 +31,21 @@ const initialDoc: JSONContent = {
   content: [{ type: "paragraph" }],
 };
 
-const DOC_ID = "main";
-
 type SnapshotContent = {
   _id: string;
   docId: string;
   content: JSONContent;
   timestamp: number;
   authorId: string;
+};
+
+type ServerDoc = {
+  _id: string;
+  title: string;
+  ownerId: string;
+  teamId?: string;
+  sharedWith: string[];
+  updatedAt: string;
 };
 
 function getAuthErrorMessage(error: unknown) {
@@ -64,18 +72,25 @@ function getUserLabelFromId(userId: string | undefined, users: { userId: string;
   return user?.email ?? userId.slice(0, 6);
 }
 
-function formatTimeAgo(timestamp: number) {
-  const diff = Date.now() - timestamp;
+function formatTimeAgo(timestamp: number | string) {
+  const ts = typeof timestamp === "string" ? new Date(timestamp).getTime() : timestamp;
+  const diff = Date.now() - ts;
 
   if (diff < 1000) return "just now";
   if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
 
-  return new Date(timestamp).toLocaleTimeString();
+  return new Date(ts).toLocaleTimeString();
 }
 
 export default function Home() {
   const { user, loading } = useAuth();
+  
+  const [activeTeamId, setActiveTeamId] = useState<string | null>(null);
+  const [documents, setDocuments] = useState<ServerDoc[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const DOC_ID = activeDocId || "main";
+
   const [authError, setAuthError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [doc, setDoc] = useState<JSONContent>(initialDoc);
@@ -91,6 +106,8 @@ export default function Home() {
   const [shareEmail, setShareEmail] = useState("");
   const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
+  const [creatingDoc, setCreatingDoc] = useState(false);
+
   const lastSnapshotRef = useRef<JSONContent | null>(null);
   const lastEditRef = useRef<number>(0);
   const lastSaveTimeRef = useRef<number>(0);
@@ -99,7 +116,7 @@ export default function Home() {
   const userId = user?.uid ?? "anonymous";
   const userLabel = user?.email ?? "anonymous";
 
-  const { meta } = useDocumentSync(userId, doc, setDoc);
+  const { meta } = useDocumentSync(user ? DOC_ID : "main", doc, setDoc);
 
   const userColor = useMemo(() => getUserColor(userId), [userId]);
   const { activeUsers } = usePresence(userId, userLabel, userColor);
@@ -112,7 +129,7 @@ export default function Home() {
   const updateCursorPosition = useMemo(
     () =>
       throttle(async (x: number, y: number) => {
-        if (!user || !userColor) return;
+        if (!user || !userColor || !DOC_ID) return;
         try {
           await firestoreSetDoc(
             firestoreDoc(db, "documents", DOC_ID, "cursors", userId),
@@ -128,16 +145,64 @@ export default function Home() {
           // Ignore write permissions if unmounting or offline
         }
       }, 100),
-    [user, userId, userColor]
+    [user, userId, userColor, DOC_ID]
   );
 
   useEffect(() => {
     return () => {
-      if (userId && userId !== "anonymous") {
+      if (userId && userId !== "anonymous" && DOC_ID) {
         firestoreDeleteDoc(firestoreDoc(db, "documents", DOC_ID, "cursors", userId)).catch(() => {});
       }
     };
-  }, [userId]);
+  }, [userId, DOC_ID]);
+
+  const loadDocuments = useCallback(async () => {
+    if (!user) return;
+    try {
+      const res = await fetch(`/api/documents?userId=${userId}&userEmail=${user.email}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDocuments(data);
+        if (data.length > 0 && !activeDocId) {
+          setActiveDocId(data[0]._id);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load documents", err);
+    }
+  }, [user, userId, activeDocId]);
+
+  useEffect(() => {
+    loadDocuments();
+  }, [loadDocuments]);
+
+  const handleCreateNewDoc = async () => {
+    if (!user || creatingDoc) return;
+    setCreatingDoc(true);
+    try {
+      const title = prompt("Enter new document title:");
+      if (!title) return;
+      const res = await fetch("/api/documents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          ownerId: userId,
+          teamId: activeTeamId || null,
+        }),
+      });
+      if (res.ok) {
+        const newDoc = await res.json();
+        setDocuments(prev => [newDoc, ...prev]);
+        setActiveDocId(newDoc._id);
+        setDoc(initialDoc); // Clear editor state for new doc
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setCreatingDoc(false);
+    }
+  };
 
   const handleSummarize = async () => {
     setLoadingSummary(true);
@@ -164,7 +229,7 @@ export default function Home() {
       return;
     }
     try {
-      const response = await fetch(`/api/snapshot?docId=${DOC_ID}`, {
+      const response = await fetch(`/api/snapshot?docId=${DOC_ID}&userId=${userId}&userEmail=${user?.email || ""}`, {
         cache: "no-store",
       });
       if (!response.ok) throw new Error("Failed to load snapshot.");
@@ -185,7 +250,7 @@ export default function Home() {
   };
 
   const saveSnapshot = async () => {
-    if (!user || savingSnapshot || !doc.content?.length) return;
+    if (!user || savingSnapshot || !doc.content?.length || !DOC_ID) return;
 
     if (lastSnapshotRef.current && JSON.stringify(lastSnapshotRef.current) === JSON.stringify(doc)) {
       return;
@@ -201,7 +266,7 @@ export default function Home() {
       const response = await fetch("/api/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ docId: DOC_ID, content: doc, authorId: userId }),
+        body: JSON.stringify({ docId: DOC_ID, content: doc, authorId: userId, userEmail: user?.email || "" }),
       });
 
       if (!response.ok) throw new Error("Failed to save snapshot.");
@@ -234,7 +299,7 @@ export default function Home() {
       setSnapshotError(null);
 
       // Async DB deletion
-      fetch(`/api/snapshot?snapshotId=${snapshotId}`, { method: "DELETE" }).catch(console.error);
+      fetch(`/api/snapshot?snapshotId=${snapshotId}&userId=${userId}&userEmail=${user?.email || ""}`, { method: "DELETE" }).catch(console.error);
 
       // Instant Firestore deletion for realtime feel
       await firestoreDeleteDoc(firestoreDoc(db, "documents", DOC_ID, "snapshots", snapshotId));
@@ -250,7 +315,7 @@ export default function Home() {
     try {
       setSnapshotError(null);
 
-      const response = await fetch(`/api/snapshot?docId=${DOC_ID}&clearAll=true`, {
+      const response = await fetch(`/api/snapshot?docId=${DOC_ID}&clearAll=true&userId=${userId}&userEmail=${user?.email || ""}`, {
         method: "DELETE",
       });
 
@@ -327,9 +392,49 @@ export default function Home() {
     }
   };
 
+  const handleShareDoc = async () => {
+    if (!shareEmail.trim() || !DOC_ID) return;
+    try {
+      setSharing(true);
+      setShareStatus(null);
+      const res = await fetch(`/api/documents/${DOC_ID}/share`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ownerId: userId,
+          email: shareEmail.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setShareStatus(data.error || "Failed to share.");
+      } else {
+        setShareStatus("Shared successfully.");
+        setShareEmail("");
+      }
+    } catch (e) {
+      setShareStatus("Failed to share.");
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  // ⚠️ All hooks MUST be called before any early returns (Rules of Hooks)
+  const activeDocObj = useMemo(
+    () => documents.find(d => d._id === activeDocId),
+    [documents, activeDocId]
+  );
+
+  const displayedDocuments = useMemo(() => {
+    if (activeTeamId) {
+      return documents.filter(d => d.teamId === activeTeamId);
+    }
+    return documents.filter(d => !d.teamId);
+  }, [documents, activeTeamId]);
+
   if (loading) {
     return (
-      <main style={{ padding: 40, fontFamily: "monospace", fontSize: 18 }}>
+      <main style={{ padding: 40, fontFamily: "var(--font-sans)", fontSize: 18, color: "var(--foreground)"}}>
         <h1>Flux</h1>
         <p>Loading...</p>
       </main>
@@ -338,13 +443,11 @@ export default function Home() {
 
   return (
     <main
+      className="animate-fade-in"
       onMouseMove={(e) => updateCursorPosition(e.clientX, e.clientY)}
       style={{
         minHeight: "100vh",
-        padding: 24,
-        fontFamily: "Arial, sans-serif",
-        backgroundColor: "#f7f7fb",
-        color: "#111827",
+        display: "flex", // Switch to flex layout
       }}
     >
       <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, pointerEvents: "none", zIndex: 9999 }}>
@@ -367,377 +470,395 @@ export default function Home() {
           />
         ))}
       </div>
-      <header
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 16,
-          padding: 16,
-          marginBottom: 20,
-          border: "1px solid #e5e7eb",
-          borderRadius: 12,
-          backgroundColor: "#ffffff",
-        }}
-      >
-        <div>
-          <h1 style={{ margin: 0, fontSize: 28 }}>Flux</h1>
-          <p style={{ margin: "6px 0 0", color: "#6b7280" }}>
-            Real-time collaborative editor
-          </p>
-        </div>
-
-        {user ? (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-              justifyContent: "flex-end",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "8px 12px",
-                borderRadius: 999,
-                backgroundColor: "#f3f4f6",
-              }}
-            >
-              <span
-                style={{
-                  width: 12,
-                  height: 12,
-                  borderRadius: "50%",
-                  backgroundColor: userColor,
-                  display: "inline-block",
-                }}
-              />
-              <span>{userLabel}</span>
-            </div>
-            <button type="button" onClick={() => void saveSnapshot()} disabled={savingSnapshot}>
-              {savingSnapshot ? "Saving Snapshot..." : "Save Snapshot"}
-            </button>
-            <button type="button" onClick={handleSignOut} disabled={submitting}>
-              {submitting ? "Signing out..." : "Sign Out"}
-            </button>
-          </div>
-        ) : null}
-      </header>
 
       {!user ? (
-        <div
-          style={{
-            padding: 24,
-            border: "1px solid #e5e7eb",
-            borderRadius: 12,
-            backgroundColor: "#ffffff",
-          }}
-        >
-          <button type="button" onClick={handleSignIn} disabled={submitting}>
-            {submitting ? "Signing in..." : "Sign in with Google"}
-          </button>
+        <div style={{ padding: 24, margin: "auto" }} className="animate-slide-up">
+          <div style={{ padding: 40, border: "1px solid var(--border-subtle)", borderRadius: 16, backgroundColor: "var(--surface)", textAlign: "center" }}>
+            <h1 style={{ margin: "0 0 16px", fontWeight: "bold" }}>Welcome to Flux</h1>
+            <p style={{ margin: "0 0 32px", color: "var(--foreground-muted)" }}>Real-time collaborative document editor</p>
+            <button type="button" className="btn btn-primary" onClick={handleSignIn} disabled={submitting}>
+              {submitting ? "Signing in..." : "Sign in with Google"}
+            </button>
+            {authError && <p style={{ color: "red", marginTop: 16 }}>{authError}</p>}
+          </div>
         </div>
       ) : (
-        <section
-          style={{
-            display: "grid",
-            gridTemplateColumns: "minmax(0, 7fr) minmax(280px, 3fr)",
-            gap: 20,
-            alignItems: "start",
-          }}
-        >
-          <div
-            style={{
-              padding: 20,
-              border: "1px solid #e5e7eb",
-              borderRadius: 12,
-              backgroundColor: "#ffffff",
-              minHeight: 500,
-            }}
-          >
-            <div style={{ marginBottom: 16 }}>
-              <p style={{ margin: 0, fontWeight: 600 }}>
-                {user.displayName ?? "Anonymous User"}
-              </p>
-              <p style={{ margin: "6px 0 0", color: "#6b7280" }}>{userLabel}</p>
-            </div>
-            <div style={{ marginBottom: 8, fontSize: 13, color: "#6b7280" }}>
-              {currentAuthor ? (
-                <>
-                  Written by{" "}
-                  <strong>
-                    {currentAuthor === userId
-                      ? "you"
-                      : getUserLabelFromId(currentAuthor, activeUsers)}
-                  </strong>
-                </>
-              ) : (
-                "Unknown author"
-              )}
+        <>
+          {/* Dashboard Sidebar */}
+          <aside style={{
+            width: 280,
+            borderRight: "1px solid var(--border)",
+            backgroundColor: "var(--surface)",
+            display: "flex",
+            flexDirection: "column",
+            height: "100vh",
+            padding: 24,
+            flexShrink: 0
+          }}>
+            <h1 style={{ margin: 0, fontSize: 24, fontWeight: "800", letterSpacing: "-0.03em" }}>Flux.</h1>
+            <div style={{ marginTop: 24, marginBottom: 24 }}>
+              <TeamManager user={user} onTeamSelect={setActiveTeamId} activeTeamId={activeTeamId} />
             </div>
 
-            <div style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, fontSize: 13, fontWeight: "600", color: "var(--foreground-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Documents</h3>
               <button 
-                type="button" 
-                onClick={() => void handleSummarize()}
-                disabled={loadingSummary}
+                onClick={handleCreateNewDoc}
+                disabled={creatingDoc}
+                className="btn btn-ghost"
+                style={{ padding: "4px 8px", fontSize: 12 }}
               >
-                {loadingSummary ? "Summarizing..." : "Generate Summary"}
+                + New
               </button>
-              
-              {summary && (
-                <div style={{ marginTop: 12, padding: 12, backgroundColor: "#f9fafb", borderRadius: 8, border: "1px solid #e5e7eb" }}>
-                  <h3 style={{ margin: "0 0 8px 0", fontSize: 14 }}>Summary</h3>
-                  <p style={{ margin: 0, fontSize: 14, whiteSpace: "pre-wrap" }}>{summary}</p>
-                </div>
-              )}
             </div>
 
-            <div style={{ marginBottom: 12, fontSize: 13, color: "#6b7280" }}>
-              {meta.updatedBy ? (
-                <>
-                  Last edited by{" "}
-                  <strong>
-                    {meta.updatedBy === userId
-                      ? "you"
-                      : getUserLabelFromId(meta.updatedBy, activeUsers)}
-                  </strong>{" "}
-                  {meta.updatedAt ? <>• {formatTimeAgo(meta.updatedAt)}</> : null}
-                </>
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+              {displayedDocuments.length === 0 ? (
+                <p style={{ fontSize: 13, color: "var(--foreground-muted)", fontStyle: "italic" }}>No documents found.</p>
               ) : (
-                "No edits yet"
-              )}
-            </div>
-            <Editor
-              value={doc}
-              userId={userId}
-              onChange={(newDoc) => {
-                lastEditRef.current = Date.now();
-                setDoc(newDoc);
-              }}
-              onCursorAuthorChange={setCurrentAuthor}
-            />
-          </div>
-
-          <aside
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 16,
-            }}
-          >
-            <section
-              style={{
-                padding: 16,
-                border: "1px solid #e5e7eb",
-                borderRadius: 12,
-                backgroundColor: "#ffffff",
-              }}
-            >
-              <h2 style={{ marginTop: 0, marginBottom: 12, fontSize: 18 }}>Active Users</h2>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {activeUsers.map((activeUser) => {
-                  const isCurrentUser = activeUser.userId === userId;
-
-                  return (
-                    <div
-                      key={activeUser.userId}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: "8px 10px",
-                        borderRadius: 10,
-                        backgroundColor: isCurrentUser ? "#eef2ff" : "#f9fafb",
-                        border: isCurrentUser ? "1px solid #c7d2fe" : "1px solid #f3f4f6",
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 12,
-                          height: 12,
-                          borderRadius: "50%",
-                          backgroundColor: activeUser.color,
-                          display: "inline-block",
-                          flexShrink: 0,
-                        }}
-                      />
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {activeUser.email}
-                        {isCurrentUser ? " (you)" : ""}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-
-            <section
-              style={{
-                padding: 16,
-                border: "1px solid #e5e7eb",
-                borderRadius: 12,
-                backgroundColor: "#ffffff",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 12,
-                  marginBottom: 12,
-                }}
-              >
-                <h2 style={{ margin: 0, fontSize: 18 }}>Snapshots</h2>
-                <button type="button" onClick={() => setShowClearSnapshotsModal(true)}>
-                  Clear All
-                </button>
-              </div>
-              <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
-                {snapshots.map((snapshot) => (
-                  <div
-                    key={snapshot.snapshotId}
+                displayedDocuments.map(d => (
+                  <button
+                    key={d._id}
+                    onClick={() => {
+                      setActiveDocId(d._id);
+                      setDoc(initialDoc); // Temporary reset before sync catches up
+                    }}
+                    className="surface-item"
                     style={{
+                      padding: "8px 12px",
+                      borderRadius: 8,
+                      textAlign: "left",
+                      border: "none",
+                      backgroundColor: activeDocId === d._id ? "var(--surface-hover)" : "transparent",
+                      color: activeDocId === d._id ? "var(--accent)" : "var(--foreground)",
+                      fontWeight: activeDocId === d._id ? 600 : "normal",
+                      cursor: "pointer",
                       display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: 8,
-                      padding: 12,
-                      borderRadius: 10,
-                      border: "1px solid #e5e7eb",
-                      backgroundColor: "#f9fafb",
+                      flexDirection: "column",
+                      gap: 4
                     }}
                   >
-                    <button
-                      type="button"
-                      onClick={() => void restoreSnapshot(snapshot.snapshotId)}
-                      style={{
-                        border: "none",
-                        background: "transparent",
-                        textAlign: "left",
-                        padding: 0,
-                        flex: 1,
-                        cursor: "pointer",
-                      }}
-                    >
-                      <div>{new Date(snapshot.timestamp).toLocaleString()}</div>
-                      <div style={{ color: "#6b7280", fontSize: 12 }}>
-                        {snapshot.authorId.slice(0, 8)}
-                      </div>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void deleteSnapshot(snapshot.snapshotId)}
-                      disabled={deletingSnapshotId === snapshot.snapshotId}
-                    >
-                      {deletingSnapshotId === snapshot.snapshotId ? "Deleting..." : "Delete"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </section>
+                    <span style={{ fontSize: 14 }}>{d.title}</span>
+                    <span style={{ fontSize: 11, color: activeDocId === d._id ? "var(--accent)" : "var(--foreground-muted)", opacity: activeDocId === d._id ? 0.8 : 0.6 }}>
+                      Updated {formatTimeAgo(d.updatedAt)}
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
 
-            <section
-              style={{
-                padding: 16,
-                border: "1px solid #e5e7eb",
-                borderRadius: 12,
-                backgroundColor: "#ffffff",
-              }}
-            >
-              <h2 style={{ marginTop: 0, marginBottom: 12, fontSize: 18 }}>Share Document</h2>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input
-                  type="email"
-                  placeholder="Enter email to share"
-                  value={shareEmail}
-                  onChange={(e) => setShareEmail(e.target.value)}
+            <div style={{ marginTop: "auto", paddingTop: 16, borderTop: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 12, height: 12, borderRadius: "50%", backgroundColor: userColor }} />
+                <span style={{ fontSize: 13, color: "var(--foreground)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{userLabel}</span>
+              </div>
+              <button onClick={handleSignOut} disabled={submitting} className="btn btn-outline" style={{ fontSize: 12, padding: "4px 8px" }}>
+                Sign Out
+              </button>
+            </div>
+          </aside>
+
+          {/* Main Editor Content */}
+          <div style={{ flex: 1, height: "100vh", overflowY: "auto", padding: "40px" }}>
+            {!activeDocId ? (
+              <div style={{ display: "flex", height: "100%", alignItems: "center", justifyContent: "center", color: "var(--foreground-muted)" }}>
+                Select a document from the sidebar or define a new one.
+              </div>
+            ) : (
+              <>
+                <header
                   style={{
-                    flex: 1,
-                    padding: "8px 10px",
-                    borderRadius: 8,
-                    border: "1px solid #d1d5db",
-                    fontSize: 14,
-                    outline: "none",
-                  }}
-                />
-                <button
-                  type="button"
-                  disabled={sharing || !shareEmail.trim()}
-                  onClick={async () => {
-                    try {
-                      setSharing(true);
-                      setShareStatus(null);
-                      const res = await fetch("/api/share", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          docId: DOC_ID,
-                          email: shareEmail.trim(),
-                          requesterId: userId,
-                        }),
-                      });
-                      const data = await res.json();
-                      if (!res.ok) {
-                        setShareStatus(data.error || "Failed to share.");
-                      } else {
-                        setShareStatus(data.message || "Shared successfully.");
-                        setShareEmail("");
-                      }
-                    } catch (e) {
-                      setShareStatus("Failed to share.");
-                    } finally {
-                      setSharing(false);
-                    }
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: 16,
+                    marginBottom: 20,
+                    border: "1px solid var(--border-subtle)",
+                    borderRadius: 16,
+                    backgroundColor: "var(--surface)",
                   }}
                 >
-                  {sharing ? "Sharing..." : "Share"}
-                </button>
-              </div>
-              {shareStatus && (
-                <p style={{ margin: "8px 0 0", fontSize: 13, color: "#6b7280" }}>{shareStatus}</p>
-              )}
-            </section>
-          </aside>
-        </section>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                    <h2 style={{ margin: 0, fontSize: 24, fontWeight: "600", letterSpacing: "-0.02em" }}>{activeDocObj?.title || DOC_ID}</h2>
+                    {activeDocObj?.teamId && (
+                      <span style={{ fontSize: 12, padding: "4px 8px", backgroundColor: "var(--surface)", border: "1px solid var(--border)", color: "var(--foreground-muted)", borderRadius: 8 }}>Team Document</span>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ display: "flex" }}>
+                        <input
+                          type="email"
+                          placeholder="Share by email"
+                          value={shareEmail}
+                          onChange={(e) => setShareEmail(e.target.value)}
+                          className="input-base"
+                          style={{
+                            borderTopRightRadius: 0,
+                            borderBottomRightRadius: 0,
+                            borderRight: "none",
+                            width: 150
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={handleShareDoc}
+                          disabled={sharing || !shareEmail.trim()}
+                          className="btn btn-outline"
+                          style={{
+                            borderTopLeftRadius: 0,
+                            borderBottomLeftRadius: 0,
+                            backgroundColor: "var(--surface-hover)"
+                          }}
+                        >
+                          {sharing ? "..." : "Share"}
+                        </button>
+                    </div>
+                    <button type="button" onClick={() => void saveSnapshot()} disabled={savingSnapshot} className="btn btn-outline">
+                      {savingSnapshot ? "Saving..." : "Save Snapshot"}
+                    </button>
+                  </div>
+                </header>
+                {shareStatus && <p style={{ fontSize: 12, color: shareStatus.includes("Failed") ? "red" : "green", marginTop: -10, marginBottom: 10, textAlign: "right" }}>{shareStatus}</p>}
+
+                <section
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "minmax(0, 7fr) minmax(280px, 3fr)",
+                    gap: 20,
+                    alignItems: "start",
+                  }}
+                >
+                  <div
+                    style={{
+                      minHeight: 500,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 32 }}>
+                      <div style={{ fontSize: 13, color: "var(--foreground-muted)" }}>
+                        {currentAuthor ? (
+                          <>
+                            Editing:{" "}
+                            <strong>
+                              {currentAuthor === userId
+                                ? "you"
+                                : getUserLabelFromId(currentAuthor, activeUsers)}
+                            </strong>
+                          </>
+                        ) : (
+                          "Ready"
+                        )}
+                      </div>
+
+                      <div style={{ fontSize: 13, color: "var(--foreground-muted)" }}>
+                        {meta.updatedBy ? (
+                          <>
+                            Last edited by{" "}
+                            <strong>
+                              {meta.updatedBy === userId
+                                ? "you"
+                                : getUserLabelFromId(meta.updatedBy, activeUsers)}
+                            </strong>{" "}
+                            {meta.updatedAt ? <>• {formatTimeAgo(meta.updatedAt)}</> : null}
+                          </>
+                        ) : (
+                          "No edits yet"
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{ marginBottom: 32 }}>
+                      <button 
+                        type="button" 
+                        onClick={() => void handleSummarize()}
+                        disabled={loadingSummary}
+                        className="btn btn-ghost"
+                        style={{ padding: "4px 0", fontSize: 13, color: "var(--accent)" }}
+                      >
+                        {loadingSummary ? "Summarizing..." : "✦ Generate Summary"}
+                      </button>
+                      
+                      {summary && (
+                        <div className="animate-slide-up" style={{ marginTop: 12, padding: 16, backgroundColor: "var(--surface-hover)", borderRadius: 12, border: "1px solid var(--border-subtle)" }}>
+                          <h3 style={{ margin: "0 0 8px 0", fontSize: 14 }}>Summary</h3>
+                          <p style={{ margin: 0, fontSize: 14, whiteSpace: "pre-wrap", color: "var(--foreground)" }}>{summary}</p>
+                        </div>
+                      )}
+                    </div>
+                    <Editor
+                      value={doc}
+                      userId={userId}
+                      onChange={(newDoc) => {
+                        lastEditRef.current = Date.now();
+                        setDoc(newDoc);
+                      }}
+                      onCursorAuthorChange={setCurrentAuthor}
+                    />
+                  </div>
+
+                  <aside
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 16,
+                    }}
+                  >
+                    <section
+                      style={{
+                        padding: 16,
+                        border: "1px solid var(--border-subtle)",
+                        borderRadius: 16,
+                        backgroundColor: "var(--surface)",
+                      }}
+                    >
+                      <h2 style={{ marginTop: 0, marginBottom: 12, fontSize: 14, fontWeight: 600 }}>Active Users</h2>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {activeUsers.map((activeUser) => {
+                          const isCurrentUser = activeUser.userId === userId;
+
+                          return (
+                            <div
+                              key={activeUser.userId}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 10,
+                                padding: "8px 10px",
+                                borderRadius: 10,
+                                backgroundColor: isCurrentUser ? "var(--surface-hover)" : "transparent",
+                              }}
+                            >
+                              <span
+                                style={{
+                                  width: 12,
+                                  height: 12,
+                                  borderRadius: "50%",
+                                  backgroundColor: activeUser.color,
+                                  display: "inline-block",
+                                  flexShrink: 0,
+                                }}
+                              />
+                              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {activeUser.email}
+                                {isCurrentUser ? " (you)" : ""}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </section>
+
+                    <section
+                      style={{
+                        padding: 16,
+                        border: "1px solid var(--border-subtle)",
+                        borderRadius: 16,
+                        backgroundColor: "var(--surface)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 12,
+                          marginBottom: 12,
+                        }}
+                      >
+                        <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Snapshots</h2>
+                        <button type="button" onClick={() => setShowClearSnapshotsModal(true)} className="btn btn-ghost" style={{fontSize: 12, padding: "2px 6px"}}>
+                          Clear All
+                        </button>
+                      </div>
+                      <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                        {snapshots.map((snapshot) => (
+                          <div
+                            key={snapshot.snapshotId}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 8,
+                              padding: "10px 12px",
+                              borderRadius: 10,
+                              backgroundColor: "var(--surface-hover)",
+                            }}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => void restoreSnapshot(snapshot.snapshotId)}
+                              style={{
+                                border: "none",
+                                background: "transparent",
+                                textAlign: "left",
+                                padding: 0,
+                                flex: 1,
+                                cursor: "pointer",
+                                color: "var(--foreground)"
+                              }}
+                            >
+                              <div style={{ fontSize: 13, fontWeight: 500 }}>{new Date(snapshot.timestamp).toLocaleString()}</div>
+                              <div style={{ color: "var(--foreground-muted)", fontSize: 12, marginTop: 4 }}>
+                                {snapshot.authorId.slice(0, 8)}
+                              </div>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void deleteSnapshot(snapshot.snapshotId)}
+                              disabled={deletingSnapshotId === snapshot.snapshotId}
+                              className="btn btn-ghost"
+                              style={{ fontSize: 11, padding: "4px 8px"}}
+                            >
+                              {deletingSnapshotId === snapshot.snapshotId ? "..." : "X"}
+                            </button>
+                          </div>
+                        ))}
+                        {snapshots.length === 0 && <p style={{ fontSize: 13, color: "var(--foreground-muted)", fontStyle: "italic", margin: 0 }}>No snapshots yet.</p>}
+                      </div>
+                    </section>
+                  </aside>
+                </section>
+              </>
+            )}
+          </div>
+        </>
       )}
 
       {showClearSnapshotsModal ? (
         <div
+          className="animate-fade-in"
           style={{
             position: "fixed",
             inset: 0,
-            backgroundColor: "rgba(17, 24, 39, 0.45)",
+            backgroundColor: "rgba(15, 23, 42, 0.4)",
+            backdropFilter: "blur(4px)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             padding: 24,
+            zIndex: 1000
           }}
         >
           <div
+            className="animate-slide-up"
             style={{
               width: "100%",
               maxWidth: 420,
-              backgroundColor: "#ffffff",
-              borderRadius: 12,
-              padding: 20,
-              border: "1px solid #e5e7eb",
+              backgroundColor: "var(--surface)",
+              borderRadius: 16,
+              padding: 24,
+              border: "1px solid var(--border-subtle)",
+              boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)",
             }}
           >
             <h3 style={{ marginTop: 0 }}>Clear all snapshots?</h3>
-            <p style={{ color: "#6b7280" }}>
+            <p style={{ color: "var(--foreground-muted)", fontSize: 14 }}>
               This will permanently remove all saved snapshots for this document.
             </p>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12 }}>
-              <button type="button" onClick={() => setShowClearSnapshotsModal(false)}>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12, marginTop: 24 }}>
+              <button type="button" onClick={() => setShowClearSnapshotsModal(false)} className="btn btn-ghost">
                 Cancel
               </button>
-              <button type="button" onClick={() => void clearAllSnapshots()}>
+              <button type="button" onClick={() => void clearAllSnapshots()} className="btn" style={{ backgroundColor: "#ef4444", color: "white" }}>
                 Delete All
               </button>
             </div>
@@ -745,8 +866,7 @@ export default function Home() {
         </div>
       ) : null}
 
-      {authError ? <p>Error: {authError}</p> : null}
-      {snapshotError ? <p>Snapshot Error: {snapshotError}</p> : null}
+      {snapshotError ? <div style={{ position: "fixed", bottom: 20, right: 20, padding: 16, backgroundColor: "#fee2e2", color: "#b91c1c", borderRadius: 8, border: "1px solid #f87171", zIndex: 1000 }}>Snapshot Error: {snapshotError}</div> : null}
     </main>
   );
 }

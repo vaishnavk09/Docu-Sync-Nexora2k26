@@ -392,6 +392,7 @@ export default function Home() {
     }
   };
 
+
   const handleShareDoc = async () => {
     if (!shareEmail.trim() || !DOC_ID) return;
     try {
@@ -431,6 +432,73 @@ export default function Home() {
     }
     return documents.filter(d => !d.teamId);
   }, [documents, activeTeamId]);
+
+  /** Convert Tiptap JSON → Markdown for local download */
+  const tiptapToMarkdown = useCallback((node: JSONContent): string => {
+    if (!node) return "";
+
+    const renderInline = (nodes: JSONContent[]): string =>
+      (nodes || []).map((n) => {
+        if (n.type === "text") {
+          let t = n.text || "";
+          if (n.marks?.some((m: any) => m.type === "bold")) t = `**${t}**`;
+          if (n.marks?.some((m: any) => m.type === "italic")) t = `*${t}*`;
+          if (n.marks?.some((m: any) => m.type === "code")) t = `\`${t}\``;
+          return t;
+        }
+        return "";
+      }).join("");
+
+    const renderNode = (n: JSONContent, listDepth = 0): string => {
+      switch (n.type) {
+        case "doc":
+          return (n.content || []).map((c) => renderNode(c)).join("\n");
+        case "heading": {
+          const level = n.attrs?.level || 1;
+          const prefix = "#".repeat(level);
+          return `${prefix} ${renderInline(n.content || [])}\n`;
+        }
+        case "paragraph":
+          return `${renderInline(n.content || [])}\n`;
+        case "bulletList":
+          return (n.content || []).map((item) => renderNode(item, listDepth + 1)).join("");
+        case "orderedList":
+          return (n.content || []).map((item, i) =>
+            renderNode({ ...item, _orderedIndex: i + 1 } as any, listDepth + 1)
+          ).join("");
+        case "listItem": {
+          const indent = "  ".repeat(Math.max(0, listDepth - 1));
+          const bullet = (n as any)._orderedIndex ? `${(n as any)._orderedIndex}.` : "-";
+          const inner = (n.content || []).map((c) =>
+            c.type === "paragraph" ? renderInline(c.content || []) : renderNode(c, listDepth)
+          ).join(" ");
+          return `${indent}${bullet} ${inner}\n`;
+        }
+        case "blockquote":
+          return (n.content || []).map((c) => `> ${renderNode(c)}`).join("");
+        case "codeBlock":
+          return `\`\`\`\n${(n.content || []).map((c) => c.text || "").join("")}\n\`\`\`\n`;
+        case "horizontalRule":
+          return "---\n";
+        default:
+          return "";
+      }
+    };
+
+    return renderNode(node);
+  }, []);
+
+  const handleDownload = useCallback(() => {
+    const markdown = tiptapToMarkdown(doc);
+    const filename = `${activeDocObj?.title || "document"}.md`;
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [doc, activeDocObj, tiptapToMarkdown]);
 
   if (loading) {
     return (
@@ -615,6 +683,15 @@ export default function Home() {
                     </div>
                     <button type="button" onClick={() => void saveSnapshot()} disabled={savingSnapshot} className="btn btn-outline">
                       {savingSnapshot ? "Saving..." : "Save Snapshot"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownload}
+                      className="btn btn-outline"
+                      title="Download as Markdown"
+                      style={{ display: "flex", alignItems: "center", gap: 6 }}
+                    >
+                      ⬇ Download
                     </button>
                   </div>
                 </header>

@@ -2,11 +2,14 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { JSONContent } from "@tiptap/core";
+import { doc as firestoreDoc, setDoc as firestoreSetDoc, deleteDoc as firestoreDeleteDoc } from "firebase/firestore";
 
 import Editor from "@/components/Editor";
 import { useDocumentSync } from "@/hooks/useDocumentSync";
 import { usePresence } from "@/hooks/usePresence";
 import { useAuth } from "@/hooks/useAuth";
+import { useSnapshotSync } from "@/hooks/useSnapshotSync";
+import { db } from "@/lib/firebase";
 import { signInWithGoogle, signOutUser } from "@/lib/auth";
 import { getUserColor } from "@/lib/color";
 
@@ -17,7 +20,7 @@ const initialDoc: JSONContent = {
 
 const DOC_ID = "main";
 
-type Snapshot = {
+type SnapshotContent = {
   _id: string;
   docId: string;
   content: JSONContent;
@@ -64,13 +67,15 @@ export default function Home() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [doc, setDoc] = useState<JSONContent>(initialDoc);
-  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const snapshots = useSnapshotSync(user ? DOC_ID : null);
+  const snapshotCache = useRef<Record<string, JSONContent>>({});
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [savingSnapshot, setSavingSnapshot] = useState(false);
   const [deletingSnapshotId, setDeletingSnapshotId] = useState<string | null>(null);
   const [showClearSnapshotsModal, setShowClearSnapshotsModal] = useState(false);
   const lastSnapshotRef = useRef<JSONContent | null>(null);
   const lastEditRef = useRef<number>(0);
+  const lastSaveTimeRef = useRef<number>(0);
   const isRestoringRef = useRef(false);
 
   const userId = user?.uid ?? "anonymous";
@@ -81,55 +86,71 @@ export default function Home() {
   const userColor = useMemo(() => getUserColor(userId), [userId]);
   const { activeUsers } = usePresence(userId, userLabel, userColor);
 
-  const loadSnapshots = async () => {
+  const restoreSnapshot = async (snapshotId: string) => {
+    isRestoringRef.current = true;
+    if (snapshotCache.current[snapshotId]) {
+      setDoc(snapshotCache.current[snapshotId]);
+      return;
+    }
     try {
       const response = await fetch(`/api/snapshot?docId=${DOC_ID}`, {
         cache: "no-store",
       });
+      if (!response.ok) throw new Error("Failed to load snapshot.");
+      const data = (await response.json()) as SnapshotContent[];
+      
+      data.forEach(s => {
+        snapshotCache.current[s._id] = s.content;
+      });
 
-      if (!response.ok) {
-        throw new Error("Failed to load snapshots.");
+      const snapshot = data.find(s => s._id === snapshotId);
+      if (snapshot) {
+        setDoc(snapshot.content);
       }
-
-      const data = (await response.json()) as Snapshot[];
-      setSnapshots(data);
-      setSnapshotError(null);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to load snapshots.";
-      setSnapshotError(message);
+      console.error(error);
+      setSnapshotError(error instanceof Error ? error.message : "Failed to restore.");
     }
   };
 
   const saveSnapshot = async () => {
     if (!user || savingSnapshot || !doc.content?.length) return;
 
+    if (lastSnapshotRef.current && JSON.stringify(lastSnapshotRef.current) === JSON.stringify(doc)) {
+      return;
+    }
+
+    if (Date.now() - lastSaveTimeRef.current < 2000) return;
+
     try {
       setSavingSnapshot(true);
       setSnapshotError(null);
+      lastSaveTimeRef.current = Date.now();
 
       const response = await fetch("/api/snapshot", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          docId: DOC_ID,
-          content: doc,
-          authorId: userId,
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docId: DOC_ID, content: doc, authorId: userId }),
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to save snapshot.");
-      }
+      if (!response.ok) throw new Error("Failed to save snapshot.");
 
-      const newSnapshot = (await response.json()) as Snapshot;
-      setSnapshots((prev) => [newSnapshot, ...prev]);
+      const newSnapshot = (await response.json()) as SnapshotContent;
+      
+      // Write to Firestore Realtime Layer
+      await firestoreSetDoc(
+        firestoreDoc(db, "documents", DOC_ID, "snapshots", newSnapshot._id),
+        {
+          snapshotId: newSnapshot._id,
+          timestamp: newSnapshot.timestamp,
+          authorId: newSnapshot.authorId,
+        }
+      );
+
+      snapshotCache.current[newSnapshot._id] = newSnapshot.content;
       lastSnapshotRef.current = doc;
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to save snapshot.";
+      const message = error instanceof Error ? error.message : "Failed to save snapshot.";
       setSnapshotError(message);
     } finally {
       setSavingSnapshot(false);
@@ -141,18 +162,13 @@ export default function Home() {
       setDeletingSnapshotId(snapshotId);
       setSnapshotError(null);
 
-      const response = await fetch(`/api/snapshot?snapshotId=${snapshotId}`, {
-        method: "DELETE",
-      });
+      // Async DB deletion
+      fetch(`/api/snapshot?snapshotId=${snapshotId}`, { method: "DELETE" }).catch(console.error);
 
-      if (!response.ok) {
-        throw new Error("Failed to delete snapshot.");
-      }
-
-      setSnapshots((prev) => prev.filter((snapshot) => snapshot._id !== snapshotId));
+      // Instant Firestore deletion for realtime feel
+      await firestoreDeleteDoc(firestoreDoc(db, "documents", DOC_ID, "snapshots", snapshotId));
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to delete snapshot.";
+      const message = error instanceof Error ? error.message : "Failed to delete snapshot.";
       setSnapshotError(message);
     } finally {
       setDeletingSnapshotId(null);
@@ -167,27 +183,20 @@ export default function Home() {
         method: "DELETE",
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to clear snapshots.");
-      }
+      if (!response.ok) throw new Error("Failed to clear snapshots.");
 
-      setSnapshots([]);
+      // For realtime UI, we iterate the metadata and remove from Firestore
+      const promises = snapshots.map((s) =>
+        firestoreDeleteDoc(firestoreDoc(db, "documents", DOC_ID, "snapshots", s.snapshotId))
+      );
+      await Promise.all(promises);
+
       setShowClearSnapshotsModal(false);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to clear snapshots.";
+      const message = error instanceof Error ? error.message : "Failed to clear snapshots.";
       setSnapshotError(message);
     }
   };
-
-  useEffect(() => {
-    if (!user) {
-      setSnapshots([]);
-      return;
-    }
-
-    void loadSnapshots();
-  }, [user]);
 
   useEffect(() => {
     if (!user) {
@@ -466,7 +475,7 @@ export default function Home() {
               <div style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
                 {snapshots.map((snapshot) => (
                   <div
-                    key={snapshot._id}
+                    key={snapshot.snapshotId}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -480,10 +489,7 @@ export default function Home() {
                   >
                     <button
                       type="button"
-                      onClick={() => {
-                        isRestoringRef.current = true;
-                        setDoc(snapshot.content);
-                      }}
+                      onClick={() => void restoreSnapshot(snapshot.snapshotId)}
                       style={{
                         border: "none",
                         background: "transparent",
@@ -500,10 +506,10 @@ export default function Home() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => void deleteSnapshot(snapshot._id)}
-                      disabled={deletingSnapshotId === snapshot._id}
+                      onClick={() => void deleteSnapshot(snapshot.snapshotId)}
+                      disabled={deletingSnapshotId === snapshot.snapshotId}
                     >
-                      {deletingSnapshotId === snapshot._id ? "Deleting..." : "Delete"}
+                      {deletingSnapshotId === snapshot.snapshotId ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                 ))}

@@ -13,6 +13,9 @@ const CustomParagraph = Paragraph.extend({
       authorId: {
         default: null,
       },
+      nodeId: {
+        default: () => crypto.randomUUID(),
+      },
     };
   },
 });
@@ -80,7 +83,6 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
             authorId: userId,
           })
         );
-        return;
       }
 
       const authorId = getCurrentAuthor();
@@ -107,6 +109,17 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
     return null;
   }
 
+  const toolbarBtnStyle = (isActive: boolean) => ({
+    padding: "4px 10px",
+    fontSize: 13,
+    fontWeight: isActive ? 700 : 500,
+    border: isActive ? "1px solid #6366f1" : "1px solid #d1d5db",
+    borderRadius: 6,
+    backgroundColor: isActive ? "#eef2ff" : "#ffffff",
+    color: isActive ? "#4338ca" : "#374151",
+    cursor: "pointer" as const,
+  });
+
   return (
     <>
       <div
@@ -122,15 +135,66 @@ export default function Editor({ value, onChange, userId, onCursorAuthorChange }
       >
         <div
           style={{
-            fontSize: 12,
-            fontWeight: 600,
-            letterSpacing: 0.3,
-            textTransform: "uppercase",
-            color: "#6b7280",
-            marginBottom: 10,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            padding: "6px 0 10px",
+            borderBottom: "1px solid #e5e7eb",
+            marginBottom: 12,
+            flexWrap: "wrap",
           }}
         >
-          Document Editor
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleBold().run(); }}
+            style={toolbarBtnStyle(editor.isActive("bold"))}
+          >
+            <strong>B</strong>
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleItalic().run(); }}
+            style={toolbarBtnStyle(editor.isActive("italic"))}
+          >
+            <em>I</em>
+          </button>
+          <div style={{ width: 1, height: 20, backgroundColor: "#d1d5db", margin: "0 4px" }} />
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleHeading({ level: 1 }).run(); }}
+            style={toolbarBtnStyle(editor.isActive("heading", { level: 1 }))}
+          >
+            H1
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleHeading({ level: 2 }).run(); }}
+            style={toolbarBtnStyle(editor.isActive("heading", { level: 2 }))}
+          >
+            H2
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleHeading({ level: 3 }).run(); }}
+            style={toolbarBtnStyle(editor.isActive("heading", { level: 3 }))}
+          >
+            H3
+          </button>
+          <div style={{ width: 1, height: 20, backgroundColor: "#d1d5db", margin: "0 4px" }} />
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleBulletList().run(); }}
+            style={toolbarBtnStyle(editor.isActive("bulletList"))}
+          >
+            • List
+          </button>
+          <button
+            type="button"
+            onMouseDown={(e) => { e.preventDefault(); editor.chain().focus().toggleOrderedList().run(); }}
+            style={toolbarBtnStyle(editor.isActive("orderedList"))}
+          >
+            1. List
+          </button>
         </div>
         <EditorContent editor={editor} className="flux-editor-content" />
       </div>

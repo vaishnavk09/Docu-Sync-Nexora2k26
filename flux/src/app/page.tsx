@@ -79,12 +79,18 @@ export default function Home() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [doc, setDoc] = useState<JSONContent>(initialDoc);
+  const [currentAuthor, setCurrentAuthor] = useState<string | null>(null);
   const snapshots = useSnapshotSync(user ? DOC_ID : null);
   const snapshotCache = useRef<Record<string, JSONContent>>({});
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [loadingSummary, setLoadingSummary] = useState(false);
   const [savingSnapshot, setSavingSnapshot] = useState(false);
   const [deletingSnapshotId, setDeletingSnapshotId] = useState<string | null>(null);
   const [showClearSnapshotsModal, setShowClearSnapshotsModal] = useState(false);
+  const [shareEmail, setShareEmail] = useState("");
+  const [shareStatus, setShareStatus] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
   const lastSnapshotRef = useRef<JSONContent | null>(null);
   const lastEditRef = useRef<number>(0);
   const lastSaveTimeRef = useRef<number>(0);
@@ -132,6 +138,24 @@ export default function Home() {
       }
     };
   }, [userId]);
+
+  const handleSummarize = async () => {
+    setLoadingSummary(true);
+    try {
+      const response = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: doc }),
+      });
+      if (!response.ok) throw new Error("Failed to summarize");
+      const data = await response.json();
+      setSummary(data.summary);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoadingSummary(false);
+    }
+  };
 
   const restoreSnapshot = async (snapshotId: string) => {
     isRestoringRef.current = true;
@@ -441,6 +465,38 @@ export default function Home() {
               </p>
               <p style={{ margin: "6px 0 0", color: "#6b7280" }}>{userLabel}</p>
             </div>
+            <div style={{ marginBottom: 8, fontSize: 13, color: "#6b7280" }}>
+              {currentAuthor ? (
+                <>
+                  Written by{" "}
+                  <strong>
+                    {currentAuthor === userId
+                      ? "you"
+                      : getUserLabelFromId(currentAuthor, activeUsers)}
+                  </strong>
+                </>
+              ) : (
+                "Unknown author"
+              )}
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <button 
+                type="button" 
+                onClick={() => void handleSummarize()}
+                disabled={loadingSummary}
+              >
+                {loadingSummary ? "Summarizing..." : "Generate Summary"}
+              </button>
+              
+              {summary && (
+                <div style={{ marginTop: 12, padding: 12, backgroundColor: "#f9fafb", borderRadius: 8, border: "1px solid #e5e7eb" }}>
+                  <h3 style={{ margin: "0 0 8px 0", fontSize: 14 }}>Summary</h3>
+                  <p style={{ margin: 0, fontSize: 14, whiteSpace: "pre-wrap" }}>{summary}</p>
+                </div>
+              )}
+            </div>
+
             <div style={{ marginBottom: 12, fontSize: 13, color: "#6b7280" }}>
               {meta.updatedBy ? (
                 <>
@@ -458,10 +514,12 @@ export default function Home() {
             </div>
             <Editor
               value={doc}
+              userId={userId}
               onChange={(newDoc) => {
                 lastEditRef.current = Date.now();
                 setDoc(newDoc);
               }}
+              onCursorAuthorChange={setCurrentAuthor}
             />
           </div>
 
@@ -582,6 +640,68 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+            </section>
+
+            <section
+              style={{
+                padding: 16,
+                border: "1px solid #e5e7eb",
+                borderRadius: 12,
+                backgroundColor: "#ffffff",
+              }}
+            >
+              <h2 style={{ marginTop: 0, marginBottom: 12, fontSize: 18 }}>Share Document</h2>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="email"
+                  placeholder="Enter email to share"
+                  value={shareEmail}
+                  onChange={(e) => setShareEmail(e.target.value)}
+                  style={{
+                    flex: 1,
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    border: "1px solid #d1d5db",
+                    fontSize: 14,
+                    outline: "none",
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={sharing || !shareEmail.trim()}
+                  onClick={async () => {
+                    try {
+                      setSharing(true);
+                      setShareStatus(null);
+                      const res = await fetch("/api/share", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          docId: DOC_ID,
+                          email: shareEmail.trim(),
+                          requesterId: userId,
+                        }),
+                      });
+                      const data = await res.json();
+                      if (!res.ok) {
+                        setShareStatus(data.error || "Failed to share.");
+                      } else {
+                        setShareStatus(data.message || "Shared successfully.");
+                        setShareEmail("");
+                      }
+                    } catch (e) {
+                      setShareStatus("Failed to share.");
+                    } finally {
+                      setSharing(false);
+                    }
+                  }}
+                >
+                  {sharing ? "Sharing..." : "Share"}
+                </button>
+              </div>
+              {shareStatus && (
+                <p style={{ margin: "8px 0 0", fontSize: 13, color: "#6b7280" }}>{shareStatus}</p>
+              )}
             </section>
           </aside>
         </section>

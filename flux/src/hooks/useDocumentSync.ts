@@ -14,13 +14,59 @@ function isSameDocument(a: JSONContent, b: JSONContent) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function intelligentlyMerge(local: JSONContent, incoming: JSONContent, base: JSONContent | null): JSONContent {
+  if (!local.content || !incoming.content || !base || !base.content) {
+    return incoming;
+  }
+
+  const merged = [];
+  
+  const localMap = new Map(local.content.map((n: any) => [n.attrs?.nodeId, n]));
+  const incomingMap = new Map(incoming.content.map((n: any) => [n.attrs?.nodeId, n]));
+  const baseMap = new Map(base.content.map((n: any) => [n.attrs?.nodeId, n]));
+
+  console.log("MERGE", { local, incoming, base });
+
+  for (const [id, incomingNode] of incomingMap) {
+    const localNode = localMap.get(id);
+    const baseNode = baseMap.get(id);
+
+    const localStr = localNode ? JSON.stringify(localNode) : null;
+    const baseStr = baseNode ? JSON.stringify(baseNode) : null;
+
+    if (localStr !== baseStr && localNode) {
+      merged.push(localNode);
+    } else {
+      merged.push(incomingNode);
+    }
+  }
+
+  for (const [id, localNode] of localMap) {
+    if (!incomingMap.has(id)) {
+      const baseNode = baseMap.get(id);
+      const localStr = JSON.stringify(localNode);
+      const baseStr = baseNode ? JSON.stringify(baseNode) : null;
+      if (localStr !== baseStr) {
+        merged.push(localNode);
+      }
+    }
+  }
+
+  return { ...incoming, content: merged };
+}
+
 export function useDocumentSync(
   userId: string,
   localDoc: JSONContent,
   setLocalDoc: SetLocalDoc,
 ) {
   const lastSentRef = useRef<JSONContent | null>(null);
+  const localDocRef = useRef(localDoc);
   const hasSnapshotRef = useRef(false);
+
+  useEffect(() => {
+    localDocRef.current = localDoc;
+  }, [localDoc]);
   const [meta, setMeta] = useState<{
     updatedBy?: string;
     updatedAt?: number;
@@ -38,10 +84,10 @@ export function useDocumentSync(
 
       if (!snapshot.exists()) {
         if (!lastSentRef.current) {
-          lastSentRef.current = localDoc;
+          lastSentRef.current = localDocRef.current;
 
           await setDoc(docRef, {
-            content: localDoc,
+            content: localDocRef.current,
             updatedAt: Date.now(),
             updatedBy: userId,
           }, { merge: true });
@@ -83,8 +129,9 @@ export function useDocumentSync(
         return;
       }
 
-      lastSentRef.current = incomingContent;
-      setLocalDoc(incomingContent);
+      const merged = intelligentlyMerge(localDocRef.current, incomingContent, lastSentRef.current);
+      lastSentRef.current = merged;
+      setLocalDoc(merged);
     });
 
     return unsubscribe;

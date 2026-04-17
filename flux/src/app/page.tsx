@@ -9,9 +9,21 @@ import { useDocumentSync } from "@/hooks/useDocumentSync";
 import { usePresence } from "@/hooks/usePresence";
 import { useAuth } from "@/hooks/useAuth";
 import { useSnapshotSync } from "@/hooks/useSnapshotSync";
+import { useCursorPresence } from "@/hooks/useCursorPresence";
 import { db } from "@/lib/firebase";
 import { signInWithGoogle, signOutUser } from "@/lib/auth";
 import { getUserColor } from "@/lib/color";
+
+function throttle<T extends (...args: any[]) => void>(fn: T, delay: number) {
+  let last = 0;
+  return (...args: Parameters<T>) => {
+    const now = Date.now();
+    if (now - last > delay) {
+      last = now;
+      fn(...args);
+    }
+  };
+}
 
 const initialDoc: JSONContent = {
   type: "doc",
@@ -85,6 +97,41 @@ export default function Home() {
 
   const userColor = useMemo(() => getUserColor(userId), [userId]);
   const { activeUsers } = usePresence(userId, userLabel, userColor);
+  const cursors = useCursorPresence(user ? DOC_ID : null);
+  
+  const activeCursors = cursors.filter(
+    (c) => Date.now() - c.timestamp < 5000 && c.userId !== userId
+  );
+
+  const updateCursorPosition = useMemo(
+    () =>
+      throttle(async (x: number, y: number) => {
+        if (!user || !userColor) return;
+        try {
+          await firestoreSetDoc(
+            firestoreDoc(db, "documents", DOC_ID, "cursors", userId),
+            {
+              userId,
+              x,
+              y,
+              timestamp: Date.now(),
+              color: userColor,
+            }
+          );
+        } catch (e) {
+          // Ignore write permissions if unmounting or offline
+        }
+      }, 100),
+    [user, userId, userColor]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (userId && userId !== "anonymous") {
+        firestoreDeleteDoc(firestoreDoc(db, "documents", DOC_ID, "cursors", userId)).catch(() => {});
+      }
+    };
+  }, [userId]);
 
   const restoreSnapshot = async (snapshotId: string) => {
     isRestoringRef.current = true;
@@ -267,6 +314,7 @@ export default function Home() {
 
   return (
     <main
+      onMouseMove={(e) => updateCursorPosition(e.clientX, e.clientY)}
       style={{
         minHeight: "100vh",
         padding: 24,
@@ -275,6 +323,26 @@ export default function Home() {
         color: "#111827",
       }}
     >
+      <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, pointerEvents: "none", zIndex: 9999 }}>
+        {activeCursors.map((cursor) => (
+          <div
+            key={cursor.userId}
+            style={{
+              position: "absolute",
+              left: cursor.x,
+              top: cursor.y,
+              backgroundColor: cursor.color,
+              width: 12,
+              height: 12,
+              borderRadius: "50%",
+              pointerEvents: "none",
+              border: "2px solid white",
+              boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+              transition: "left 0.1s linear, top 0.1s linear"
+            }}
+          />
+        ))}
+      </div>
       <header
         style={{
           display: "flex",

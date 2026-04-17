@@ -5,10 +5,23 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import Placeholder from "@tiptap/extension-placeholder";
 import StarterKit from "@tiptap/starter-kit";
 import type { JSONContent } from "@tiptap/core";
+import { Paragraph } from "@tiptap/extension-paragraph";
+
+const CustomParagraph = Paragraph.extend({
+  addAttributes() {
+    return {
+      authorId: {
+        default: null,
+      },
+    };
+  },
+});
 
 type EditorProps = {
-  value: any;
-  onChange: (val: any) => void;
+  value: JSONContent;
+  onChange: (val: JSONContent) => void;
+  userId: string;
+  onCursorAuthorChange: (authorId: string | null) => void;
 };
 
 const INITIAL_DOC: JSONContent = {
@@ -16,23 +29,62 @@ const INITIAL_DOC: JSONContent = {
   content: [{ type: "paragraph" }],
 };
 
-export default function Editor({ value, onChange }: EditorProps) {
+export default function Editor({ value, onChange, userId, onCursorAuthorChange }: EditorProps) {
   const isApplyingExternalUpdate = useRef(false);
 
   const editor = useEditor({
     immediatelyRender: false,
     extensions: [
-      StarterKit,
+      StarterKit.configure({
+        paragraph: false,
+      }),
+      CustomParagraph,
       Placeholder.configure({
         placeholder: "Start typing collaboratively...",
       }),
     ],
     content: value ?? INITIAL_DOC,
+    onSelectionUpdate: ({ editor: currentEditor }) => {
+      function getCurrentAuthor() {
+        const { $head } = currentEditor.state.selection;
+        if ($head && $head.parent && $head.parent.type.name === "paragraph") {
+          return $head.parent.attrs.authorId || null;
+        }
+        return null;
+      }
+      onCursorAuthorChange(getCurrentAuthor());
+    },
     onUpdate: ({ editor: currentEditor }) => {
       if (isApplyingExternalUpdate.current) {
         isApplyingExternalUpdate.current = false;
         return;
       }
+
+      function getCurrentAuthor() {
+        const { $head } = currentEditor.state.selection;
+        if ($head && $head.parent && $head.parent.type.name === "paragraph") {
+          return $head.parent.attrs.authorId || null;
+        }
+        return null;
+      }
+
+      const { state, view } = currentEditor;
+      const { $head } = state.selection;
+      const node = $head.parent;
+
+      if (node && node.type.name === "paragraph" && node.attrs.authorId !== userId) {
+        const pos = $head.before();
+        view.dispatch(
+          state.tr.setNodeMarkup(pos, undefined, {
+            ...node.attrs,
+            authorId: userId,
+          })
+        );
+        return;
+      }
+
+      const authorId = getCurrentAuthor();
+      onCursorAuthorChange(authorId);
 
       const json = currentEditor.getJSON();
       onChange(json);
